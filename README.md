@@ -8,7 +8,7 @@ A collection of Python utilities for scientific computing — data processing, a
 
 | Tool | Description | Details |
 |---|---|---|
-| **cem-data-collection** | Extract and report metadata from Thermo Fisher EPU cryo-EM sessions | [README](tools/cem-data-collection/README.md) |
+| **cem-data-collection** | Collect metadata from multiple cryo-EM collections (auto-discovery, EPU modern + legacy) | [README](tools/cem-data-collection/README.md) |
 
 *More tools coming soon!*
 
@@ -23,7 +23,7 @@ python-scripts-toolbox/
 ├── .gitignore
 └── tools/
     └── cem-data-collection/
-        ├── Data_Collection.py
+        ├── CryoEM_Collector.py
         └── README.md
 ```
 

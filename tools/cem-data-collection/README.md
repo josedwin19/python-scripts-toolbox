@@ -1,139 +1,167 @@
-# EPU Session Metadata Extractor
+# CryoEM Collector
 
-A lightweight, standard-library Python utility designed to parse Thermo Fisher Scientific EPU cryo-EM session directories. It automatically aggregates metadata from multiple sources, processes fraction logs, and generates structured acquisition reports in either human-readable text or machine-readable JSON formats.
+Metadata collector for cryo-EM data acquisition directories. Automatically discovers and scans all cryo-EM collections under a base directory (default: `~/cryosparc_projs`), extracts key acquisition parameters from EPU XML/DM metadata, and generates structured reports in text or JSON format.
+
+> **Originally migrated from [CEM_data_collection](https://github.com/josedwin19/CEM_data_collection) (archived).** This version has been rewritten to handle **multiple collections** with automatic discovery, supporting both modern EPU and legacy directory layouts.
 
 ---
 
 ## Key Features
 
-- **Session Info Extraction**: Reads session name, EPU version, phase plate status, and autoloader slot from `EpuSession.dm`.
-- **Acquisition Presets**: Parses total exposure time, fractions count, electron counting status, and super-resolution factor from `Preset_*.sxml`.
-- **Microscope Optics**: Extracts nominal voltage (kV), spherical aberration $C_s$ (mm), nominal magnification, and pixel size from movie-level XMLs (`FoilHole_*.xml`).
-- **Camera & Detector Stats**: Identifies commercial/internal detector names, image dimensions, and calibrated pixel size at sample level (in Ångströms).
-- **Dose Accumulation Statistics**: Computes average total dose per movie, average dose per fraction, standard deviation, and dose range across a configurable sample size of movie metadata files.
-- **Defocus Settings**: Parses defocus range (in µm) and objective aperture size from user-provided notes (`Defocus*.txt`).
-
----
-
-## Directory Layout Expected
-
-The utility expects the standard directory tree layout outputted by Thermo Fisher EPU:
-
-```text
-session_dir/
-├── EpuSession.dm              # Session-level metadata
-├── Preset_*.sxml              # Acquisition presets
-├── Defocus*.txt               # User-provided defocus notes (optional)
-├── Metadata/
-│   └── GridSquare_*.dm
-└── Images-Disc*/
-    └── GridSquare_XXXXXXX/
-        ├── Data/
-        │   ├── FoilHole_*_Fractions.xml  # Per-movie dose & camera data
-        │   └── FoilHole_*.xml            # Per-movie optics (voltage, Cs, mag)
-        └── FoilHoles/
-```
+- **Auto-discovery**: Scans a base directory and finds all cryo-EM collections automatically — no need to specify each session individually.
+- **Dual layout support**:
+  - **Modern EPU** (3.x+): directories with `EpuSession.dm`, `Images-Disc*/GridSquare*/Data/FoilHole_*.xml`
+  - **Legacy**: flat `*_Fractions.xml` files in session root (no `EpuSession.dm`)
+- **Exclusion filter**: Automatically skips `CS-edwin` project directories.
+- **PAD4 support**: Detects collections inside `PAD4/` subdirectory.
+- **Rich metadata extraction** per collection:
+  - Pixel size (Å), acceleration voltage (kV), nominal magnification
+  - Detector name, electron counting status
+  - Total dose (e⁻/Å²), dose rate, exposure time
+  - Defocus range and individual defocus values (µm)
+  - Fractions per movie (expected vs. recorded)
+  - Session start date, first/last acquisition timestamps
+  - Grid square count, foil hole count, movie count
+- **Two output formats**: human-readable text (with summary table + per-collection details) and machine-readable JSON.
+- **No external dependencies**: Pure Python standard library (`re`, `json`, `argparse`, `datetime`, `pathlib`).
 
 ---
 
 ## Requirements
 
 - **Python 3.8+**
-- **No external dependencies**: The script utilizes only built-in Python standard library modules (`os`, `re`, `json`, `xml`, etc.) and does not require third-party libraries.
+- No third-party libraries required.
 
 ---
 
-## Usage Guide
+## Usage
 
-You can run [Data_Collection.py](file:///home/jose.quesnay/Documents/CEM/Data_Collection_metadata/Data_Collection.py) by specifying the path to your EPU session directory.
+### Default scan (text report to stdout)
 
-### Basic Command (Generate Text Report)
-Generates a human-readable text report and saves it by default to `<session_dir>/epu_report.txt`:
 ```bash
-python Data_Collection.py /path/to/epu_session_dir
+python3 CryoEM_Collector.py
 ```
 
-### Save as JSON
-Generates a machine-readable JSON file:
+Scans `~/cryosparc_projs` and prints a text report.
+
+### Custom base directory
+
 ```bash
-python Data_Collection.py /path/to/epu_session_dir --format json --output report.json
+python3 CryoEM_Collector.py --base /path/to/cryoem_data
 ```
 
-### Options & Arguments
+### Save report to file
+
+```bash
+python3 CryoEM_Collector.py -o report.txt
+```
+
+### JSON output
+
+```bash
+python3 CryoEM_Collector.py --format json -o report.json
+```
+
+### All options
 
 | Parameter | Shorthand | Description | Default |
-| :--- | :--- | :--- | :--- |
-| `session_dir` | *(Positional)* | Root path of the EPU session directory. | *(Required)* |
-| `--output` | `-o` | Custom path to save the output file. | `<session_dir>/epu_report.<ext>` |
-| `--format` | `-f` | Format of output: `text` or `json`. | `text` |
-| `--max-movies`| | Limit the number of Fractions XMLs parsed for dose averaging (helps speed up processing on large directories). | `500` |
+|---|---|---|---|
+| `--base` | `-b` | Base directory to scan for collections | `~/cryosparc_projs` |
+| `--format` | `-f` | Output format: `text` or `json` | `text` |
+| `--output` | `-o` | Write output to file instead of stdout | *(stdout)* |
 
-To see full CLI help options, run:
 ```bash
-python Data_Collection.py --help
+python3 CryoEM_Collector.py --help
 ```
 
 ---
 
-## Example Output Report
+## Example Text Report
 
-Below is an example of the text format report generated by the tool:
-
-```text
-============================================================
-  EPU SESSION — DATA COLLECTION REPORT
-============================================================
-  Generated: 2026-05-26T15:08:55
-  Session path: /path/to/epu_session_dir
-
-── SESSION ──────────────────────────────────────────
-  Session name    : EPU_Demo_Session
-  EPU version     : 3.10.0
-  Phase plate     : False
-  AutoLoader slot : 3
-
-── COLLECTION SUMMARY ───────────────────────────────
-  Grid squares collected : 4
-  Foil holes (with XML)  : 1240
-  Movies (total)         : 980
-  First acquisition      : 2026-05-26T09:12:45
-  Last acquisition       : 2026-05-26T14:55:12
-
-── MICROSCOPE OPTICS ────────────────────────────────
-  Acceleration voltage : 300 kV
-  Spherical aberration : 2.7 mm
-  Nominal magnification: 130,000x
-
-── DETECTOR ─────────────────────────────────────────
-  Detector          : Falcon 4i
-  Camera name       : Falcon4
-  Electron counting : True
-  Super-resolution  : No (factor: 1)
-  Image size        : 4096 × 4096 pixels
-
-── ACQUISITION PARAMETERS ───────────────────────────
-  Pixel size        : 0.83 Å
-  Factions/movie    : 40
-  Total exposure    : 1.85 s
-
-── DOSE ─────────────────────────────────────────────
-  Avg total dose/movie    : 45.20 e⁻/Å²
-  Avg dose/fraction       : 1.1300 e⁻/Å²
-  Std dev (total dose)    : 0.15 e⁻/Å²
-  Dose range              : 44.90 – 45.50 e⁻/Å²
-  Movies used for avg     : 500
-
-── DEFOCUS & OPTICS SETTINGS ────────────────────────
-  Defocus range     : -0.8 to -2.0 µm
-  Objective aperture: 100 µm
-
-── PRESET FILE ──────────────────────────────────────
-  File: Preset_DataAcquisition.sxml
-
-============================================================
-  NOTE: Acceleration voltage, Cs, and nominal
-  magnification are read from the per-movie
-  FoilHole_*.xml (non-Fractions). If those files
-  are absent, values will show as N/A.
-============================================================
 ```
+========================================================================================================================
+  Cryo-EM COLLECTIONS REPORT — cryosparc_projs (excl. CS-edwin)
+  Base: /home/user/cryosparc_projs
+  Generated: 2026-07-30T16:14:00
+========================================================================================================================
+
+#   Collection                                             Type    Movies  GS    Pixel    Detector      kV   Fracs  Defocus   Dose        StartDate   EndDate
+------------------------------------------------------------------------------------------------------------------------
+1   ProjectA/session_2026_01                                modern  980     4     0.83 Å   Falcon 4i     300  40     -0.8 to -2.0 µm  45.20 e/Å²  2026-01-15  2026-01-15
+2   ProjectB/PAD4/legacy_session                            legacy  320     -     0.89 Å   Falcon 4i     200  32     -1.0 to -2.5 µm  50.10 e/Å²  2025-12-10  2025-12-11
+
+DETAILS:
+
+[1] ProjectA/session_2026_01
+     Type: Modern EPU
+     GridSquares: 4 | FoilHoles: 1240 | Fractions XML: 980
+     Pixel size: 0.83 Å
+     Magnification: 130000x
+     Voltage: 300 kV
+     Detector: Falcon 4i
+     Electron counting: true
+     Fractions/movie: 40
+     Defocus range: -0.8 to -2.0 µm
+     Defocus values: [-2.0, -1.8, -1.5, -1.2, -1.0, -0.8] µm
+     Total dose: 45.20 e⁻/Å²
+     Dose rate: 24.43 e⁻/Å²/s
+     Exposure time: 1.85 s
+     Session start: 2026-01-15 09:12
+     First movie: 2026-01-15 09:12:45
+     Last movie: 2026-01-15 14:55:12
+
+[2] ProjectB/PAD4/legacy_session
+     ...
+
+========================================================================================================================
+  Total: 2 collections (1 modern EPU + 1 legacy)
+========================================================================================================================
+```
+
+## Example JSON Output
+
+```json
+[
+  {
+    "name": "session_2026_01",
+    "rel_path": "ProjectA/session_2026_01",
+    "type": "modern_epu",
+    "grid_squares": 4,
+    "foil_holes": 1240,
+    "fractions_xml": 980,
+    "pixel_size_A": 0.83,
+    "voltage_kV": 300,
+    "magnification": 130000,
+    "detector": "Falcon 4i",
+    "electron_counting": "true",
+    "fractions_per_movie": 40,
+    "defocus_um": -1.5,
+    "defocus_range_um": [-2.0, -0.8],
+    "defocus_values_um": [-2.0, -1.8, -1.5, -1.2, -1.0, -0.8],
+    "total_dose_e_A2": 45.2,
+    "dose_rate_e_A2_s": 24.43,
+    "exposure_time_s": 1.85,
+    "session_start": "2026-01-15T09:12:00",
+    "first_acq": "2026-01-15T09:12:45",
+    "last_acq": "2026-01-15T14:55:12"
+  }
+]
+```
+
+---
+
+## How It Works
+
+1. **Discovery**: Scans the base directory recursively for `EpuSession.dm` files (modern EPU) and top-level directories with `*_Fractions.xml` (legacy). Skips `CS-edwin`.
+2. **Metadata extraction**: For each collection:
+   - Reads `EpuSession.dm` for session name, start date, and defocus values.
+   - Parses a sample `FoilHole_*.xml` (non-Fractions) for pixel size, voltage, magnification, detector, dose, defocus, exposure time.
+   - Parses a `*_Fractions.xml` for fractions count, electron counting, detector name.
+   - Samples first/last FoilHole files to determine acquisition date range.
+3. **Report generation**: Aggregates all collections into a summary table (text) or array of objects (JSON).
+
+---
+
+## License
+
+MIT — see the [toolbox LICENSE](../../LICENSE).
