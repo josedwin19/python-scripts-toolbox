@@ -30,7 +30,7 @@ def find_first(pattern, text, flags=0):
 
 def fmt_px(px_str):
     if not px_str: return ""
-    try: return f"{float(px_str) * 1e10:.2f} Å"
+    try: return f"{float(px_str) * 1e10:.5f} Å"
     except: return ""
 
 
@@ -89,12 +89,12 @@ def parse_foilhole_xml(xml_path):
 
     dose = custom.get("DoseOnCamera") or custom.get("Detectors[BM-Falcon].TotalDose")
     if dose:
-        try: info["total_dose_e_A2"] = round(float(dose), 2)
+        try: info["dose_on_camera_e_A2"] = round(float(dose), 2)
         except: pass
 
     dr = custom.get("Detectors[BM-Falcon].DoseRate") or custom.get("DoseRate")
     if dr:
-        try: info["dose_rate_e_A2_s"] = round(float(dr), 2)
+        try: info["dose_rate_setpoint_e_A2_s"] = round(float(dr), 2)
         except: pass
 
     exp = custom.get("Detectors[BM-Falcon].ExposureTime") or find_first(
@@ -150,6 +150,38 @@ def parse_fractions_xml(xml_path):
     dt = find_first(r"<DateTimeWithTimeZone>([^<]+)<", content)
     if dt: info["frac_datetime"] = dt
 
+    # Sensor pixel size (specimen-level, calibrated) — fallback pixel source
+    sps = find_first(r"<SensorPixelSize>\s*<Width>([0-9.eE+-]+)</Width>", content)
+    if sps:
+        try: info["sensor_pixel_size_m"] = float(sps)
+        except: pass
+
+    # Per-fraction dose statistics (only <SampleType>DoseFraction</SampleType> blocks)
+    doses, rates, exposures = [], [], []
+    for blk in re.findall(r"<Fraction>(.*?)</Fraction>", content, re.DOTALL):
+        st = find_first(r"<SampleType>([^<]+)</SampleType>", blk)
+        if st and st.strip() != "DoseFraction":
+            continue
+        td = find_first(r"<TotalDose>([0-9.eE+-]+)<", blk)
+        dr = find_first(r"<DoseRate>([0-9.eE+-]+)<", blk)
+        ex = find_first(r"<ExposureTime>([0-9.eE+-]+)<", blk)
+        try:
+            if td is not None: doses.append(float(td))
+            if dr is not None: rates.append(float(dr))
+            if ex is not None: exposures.append(float(ex))
+        except: pass
+
+    if doses:
+        info["n_dose_fractions"] = len(doses)
+        info["total_dose_frac_sum_e_A2"] = round(sum(doses), 2)
+        info["dose_per_fraction_e_A2"] = round(sum(doses) / len(doses), 3)
+        info["fraction_dose_range_e_A2"] = [round(min(doses), 3), round(max(doses), 3)]
+    if rates:
+        info["avg_dose_rate_e_A2_s"] = round(sum(rates) / len(rates), 3)
+    if exposures:
+        info["frac_exposure_time_s"] = round(exposures[0], 3)
+        info["total_exposure_s"] = round(sum(exposures), 2)
+
     return info
 
 
@@ -185,6 +217,22 @@ def extract_metadata(session_path):
         break
     if frac_xml:
         meta.update(parse_fractions_xml(frac_xml))
+
+    # ── Resolve pixel size: main XML first, else SensorPixelSize ────────────
+    if not meta.get("pixel_size_m") and meta.get("sensor_pixel_size_m"):
+        meta["pixel_size_m"] = meta["sensor_pixel_size_m"]
+        meta["pixel_size_source"] = "SensorPixelSize"
+
+    # ── Resolve dose: sum of fraction TotalDose preferred; DoseOnCamera as
+    #    fallback and as an independent reference value ─────────────────────
+    if "total_dose_frac_sum_e_A2" in meta:
+        meta["total_dose_e_A2"] = meta["total_dose_frac_sum_e_A2"]
+        meta["dose_source"] = f"sum of {meta.get('n_dose_fractions', '?')} fractions"
+    elif "dose_on_camera_e_A2" in meta:
+        meta["total_dose_e_A2"] = meta["dose_on_camera_e_A2"]
+        meta["dose_source"] = "DoseOnCamera (movie XML)"
+    if "avg_dose_rate_e_A2_s" in meta:
+        meta["dose_rate_e_A2_s"] = meta["avg_dose_rate_e_A2_s"]
 
 # ── Session start date + defocus range from EpuSession.dm ─────────────
     dm_file = p / "EpuSession.dm"
@@ -378,8 +426,8 @@ def _text_report(base, collections):
 
     # Summary table
     hdr = (f"{'#':<3} {'Collection':<58} {'Type':<7} {'Movies':<7} {'GS':<5} "
-           f"{'Pixel':<9} {'Detector':<14} {'kV':<4} {'Fracs':<6} {'Defocus':<9} "
-           f"{'Dose':<10} {'StartDate':<12} {'EndDate':<12}")
+           f"{'Pixel':<11} {'Detector':<14} {'kV':<4} {'Fracs':<6} {'Defocus':<9} "
+           f"{'Dose':<12} {'StartDate':<12} {'EndDate':<12}")
     lines.append(hdr)
     lines.append("-" * 120)
 
@@ -405,7 +453,7 @@ def _text_report(base, collections):
         end = fmt_date_short(m.get("last_acq", ""))[:16]
         lines.append(
             f"{i:<3} {c['rel_path']:<58} {c['type'][:7]:<7} {str(movies):<7} {gs:<5} "
-            f"{px:<9} {det:<14} {volt:<4} {fracs_str:<6} {defocus:<9} {dose:<10} "
+            f"{px:<11} {det:<14} {volt:<4} {fracs_str:<6} {defocus:<9} {dose:<12} "
             f"{start:<12} {end:<12}"
         )
 
@@ -420,7 +468,9 @@ def _text_report(base, collections):
                      f"FoilHoles: {c['foil_holes']} | Fractions XML: {c['fractions_xml']}")
 
         px = fmt_px(m.get("pixel_size_m", ""))
-        if px: lines.append(f"     Pixel size: {px}")
+        if px:
+            src = " (SensorPixelSize)" if m.get("pixel_size_source") == "SensorPixelSize" else ""
+            lines.append(f"     Pixel size: {px}{src}")
         if m.get("magnification"): lines.append(f"     Magnification: {m['magnification']}x")
         if m.get("voltage_v"): lines.append(f"     Voltage: {int(m['voltage_v'])/1000:.0f} kV")
         if m.get("detector"): lines.append(f"     Detector: {m['detector']}")
@@ -436,10 +486,21 @@ def _text_report(base, collections):
                 lines.append(f"     Defocus values: {m['defocus_values_um']} µm")
         elif m.get("defocus_um"):
             lines.append(f"     Applied defocus: {m['defocus_um']} µm")
-        if m.get("total_dose_e_A2"): lines.append(f"     Total dose: {m['total_dose_e_A2']} e⁻/Å²")
-        if m.get("dose_rate_e_A2_s"): lines.append(f"     Dose rate: {m['dose_rate_e_A2_s']} e⁻/Å²/s")
-        if m.get("exposure_time_s"): lines.append(f"     Exposure time: {m['exposure_time_s']} s")
-        elif m.get("frac_exposure_time_s"): lines.append(f"     Exposure per fraction: {m['frac_exposure_time_s']} s")
+        if m.get("total_dose_e_A2"):
+            src = m.get("dose_source")
+            lines.append(f"     Total dose: {m['total_dose_e_A2']} e⁻/Å²" + (f" ({src})" if src else ""))
+        if m.get("dose_per_fraction_e_A2") and m.get("fraction_dose_range_e_A2"):
+            dmin, dmax = m["fraction_dose_range_e_A2"]
+            rng = f", range {dmin} – {dmax}" if dmin != dmax else ""
+            lines.append(f"     Dose per fraction: avg {m['dose_per_fraction_e_A2']}{rng} e⁻/Å²")
+        if m.get("dose_rate_e_A2_s"):
+            rate_src = "avg over fractions" if "avg_dose_rate_e_A2_s" in m else "movie XML"
+            lines.append(f"     Dose rate: {m['dose_rate_e_A2_s']} e⁻/Å²/s ({rate_src})")
+        if m.get("dose_on_camera_e_A2") and m.get("dose_on_camera_e_A2") != m.get("total_dose_e_A2"):
+            lines.append(f"     DoseOnCamera (ref): {m['dose_on_camera_e_A2']} e⁻/Å²")
+        if m.get("frac_exposure_time_s"): lines.append(f"     Exposure per fraction: {m['frac_exposure_time_s']} s")
+        if m.get("total_exposure_s"): lines.append(f"     Total exposure: {m['total_exposure_s']} s")
+        elif m.get("exposure_time_s"): lines.append(f"     Exposure time: {m['exposure_time_s']} s")
 
         if m.get("session_start"):
             lines.append(f"     Session start: {fmt_date_short(m['session_start'])}")
@@ -469,7 +530,8 @@ def _json_report(base, collections):
             "grid_squares": c["grid_squares"],
             "foil_holes": c["foil_holes"],
             "fractions_xml": c["fractions_xml"],
-            "pixel_size_A": round(float(m.get("pixel_size_m", 0)) * 1e10, 4) if m.get("pixel_size_m") else None,
+            "pixel_size_A": round(float(m.get("pixel_size_m", 0)) * 1e10, 5) if m.get("pixel_size_m") else None,
+            "pixel_size_source": m.get("pixel_size_source"),
             "voltage_kV": int(m["voltage_v"]) / 1000 if m.get("voltage_v") else None,
             "magnification": int(m["magnification"]) if m.get("magnification") else None,
             "detector": m.get("detector"),
@@ -479,8 +541,14 @@ def _json_report(base, collections):
             "defocus_range_um": m.get("defocus_range_um"),
             "defocus_values_um": m.get("defocus_values_um"),
             "total_dose_e_A2": m.get("total_dose_e_A2"),
+            "dose_source": m.get("dose_source"),
+            "dose_on_camera_e_A2": m.get("dose_on_camera_e_A2"),
+            "dose_per_fraction_e_A2": m.get("dose_per_fraction_e_A2"),
+            "fraction_dose_range_e_A2": m.get("fraction_dose_range_e_A2"),
+            "n_dose_fractions": m.get("n_dose_fractions"),
             "dose_rate_e_A2_s": m.get("dose_rate_e_A2_s"),
             "exposure_time_s": m.get("exposure_time_s"),
+            "total_exposure_s": m.get("total_exposure_s"),
             "session_start": m.get("session_start"),
             "first_acq": m.get("first_acq"),
             "last_acq": m.get("last_acq"),
