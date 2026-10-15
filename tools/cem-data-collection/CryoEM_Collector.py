@@ -87,14 +87,24 @@ def parse_foilhole_xml(xml_path):
         try: info["defocus_um"] = round(float(df) * 1e6, 2)
         except: pass
 
-    dose = custom.get("DoseOnCamera") or custom.get("Detectors[BM-Falcon].TotalDose")
-    if dose:
-        try: info["dose_on_camera_e_A2"] = round(float(dose), 2)
+    # Dose fields — NOTE on units (validated on Falcon 3EC and BioContinuum K3):
+    #   'Dose'          : specimen dose in e/m² (SI) — authoritative value
+    #   'DoseOnCamera'  : accumulated electrons per counted pixel (e/pix)
+    #   'DoseRate'      : electrons per counted pixel per second (e/pix/s)
+    # Conversion: dose [e/Å²] = Dose/1e20 = DoseOnCamera / pixel_size² [Å²]
+    dose_si = custom.get("Dose")
+    if dose_si:
+        try: info["dose_si_e_m2"] = float(dose_si)
         except: pass
 
-    dr = custom.get("Detectors[BM-Falcon].DoseRate") or custom.get("DoseRate")
+    dose = custom.get("DoseOnCamera") or custom.get("Detectors[BM-Falcon].TotalDose")
+    if dose:
+        try: info["dose_on_camera_e_pix"] = round(float(dose), 3)
+        except: pass
+
+    dr = custom.get("DoseRate") or custom.get("Detectors[BM-Falcon].DoseRate")
     if dr:
-        try: info["dose_rate_setpoint_e_A2_s"] = round(float(dr), 2)
+        try: info["dose_rate_e_pix_s"] = round(float(dr), 3)
         except: pass
 
     exp = custom.get("Detectors[BM-Falcon].ExposureTime") or find_first(
@@ -156,7 +166,9 @@ def parse_fractions_xml(xml_path):
         try: info["sensor_pixel_size_m"] = float(sps)
         except: pass
 
-    # Per-fraction dose statistics (only <SampleType>DoseFraction</SampleType> blocks)
+    # Per-fraction dose statistics (only <SampleType>DoseFraction</SampleType> blocks).
+    # RAW units: TotalDose in e/pix, DoseRate in e/pix/s (converted to e/Å²
+    # later, once the pixel size is resolved).
     doses, rates, exposures = [], [], []
     for blk in re.findall(r"<Fraction>(.*?)</Fraction>", content, re.DOTALL):
         st = find_first(r"<SampleType>([^<]+)</SampleType>", blk)
@@ -173,11 +185,11 @@ def parse_fractions_xml(xml_path):
 
     if doses:
         info["n_dose_fractions"] = len(doses)
-        info["total_dose_frac_sum_e_A2"] = round(sum(doses), 2)
-        info["dose_per_fraction_e_A2"] = round(sum(doses) / len(doses), 3)
-        info["fraction_dose_range_e_A2"] = [round(min(doses), 3), round(max(doses), 3)]
+        info["frac_dose_sum_e_pix"] = round(sum(doses), 2)
+        info["frac_dose_avg_e_pix"] = round(sum(doses) / len(doses), 3)
+        info["frac_dose_range_e_pix"] = [round(min(doses), 3), round(max(doses), 3)]
     if rates:
-        info["avg_dose_rate_e_A2_s"] = round(sum(rates) / len(rates), 3)
+        info["frac_rate_avg_e_pix_s"] = round(sum(rates) / len(rates), 3)
     if exposures:
         info["frac_exposure_time_s"] = round(exposures[0], 3)
         info["total_exposure_s"] = round(sum(exposures), 2)
@@ -187,7 +199,7 @@ def parse_fractions_xml(xml_path):
 
 # ── metadata extraction per session ─────────────────────────────────────────
 
-def extract_metadata(session_path):
+def extract_metadata(session_path, max_movies=25):
     """Extract all metadata for a session (modern EPU or legacy)."""
     p = Path(session_path)
     meta = {}
@@ -218,21 +230,122 @@ def extract_metadata(session_path):
     if frac_xml:
         meta.update(parse_fractions_xml(frac_xml))
 
-    # ── Resolve pixel size: main XML first, else SensorPixelSize ────────────
+    # ── Resolve pixel size: movie XML first, else SensorPixelSize ───────────
     if not meta.get("pixel_size_m") and meta.get("sensor_pixel_size_m"):
         meta["pixel_size_m"] = meta["sensor_pixel_size_m"]
         meta["pixel_size_source"] = "SensorPixelSize"
+    px_A = None
+    if meta.get("pixel_size_m"):
+        try: px_A = float(meta["pixel_size_m"]) * 1e10
+        except: pass
 
-    # ── Resolve dose: sum of fraction TotalDose preferred; DoseOnCamera as
-    #    fallback and as an independent reference value ─────────────────────
-    if "total_dose_frac_sum_e_A2" in meta:
-        meta["total_dose_e_A2"] = meta["total_dose_frac_sum_e_A2"]
-        meta["dose_source"] = f"sum of {meta.get('n_dose_fractions', '?')} fractions"
-    elif "dose_on_camera_e_A2" in meta:
-        meta["total_dose_e_A2"] = meta["dose_on_camera_e_A2"]
-        meta["dose_source"] = "DoseOnCamera (movie XML)"
-    if "avg_dose_rate_e_A2_s" in meta:
-        meta["dose_rate_e_A2_s"] = meta["avg_dose_rate_e_A2_s"]
+    # ── Sample several movie XMLs for per-movie dose / rate / defocus ──────
+    # Dose varies between movies of the same session, so a single sample is
+    # not representative. Evenly sample up to `max_movies` XMLs.
+    movie_xmls = sorted(
+        (f for f in p.glob("**/FoilHole_*.xml") if "_Fractions" not in f.name),
+        key=lambda f: f.name,
+    )
+    if not movie_xmls:
+        movie_xmls = sorted(
+            (f for f in p.glob("FoilHole_*.xml") if "_Fractions" not in f.name),
+            key=lambda f: f.name,
+        )
+
+    if movie_xmls:
+        n = len(movie_xmls)
+        if n > max_movies:
+            idxs = sorted(set(round(i * (n - 1) / (max_movies - 1)) for i in range(max_movies)))
+            sample_files = [movie_xmls[i] for i in idxs]
+        else:
+            sample_files = movie_xmls
+
+        dose_vals, dose_srcs, rate_vals, doc_vals, defoci = [], set(), [], [], set()
+        for mf in sample_files:
+            try:
+                content = mf.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            custom = extract_custom_data(content)
+
+            si = custom.get("Dose")
+            if si:
+                try:
+                    dose_vals.append(float(si) / 1e20)
+                    dose_srcs.add("Dose key (e/m²)")
+                except: pass
+            else:
+                doc = custom.get("DoseOnCamera")
+                if doc and px_A:
+                    try:
+                        dose_vals.append(float(doc) / (px_A * px_A))
+                        dose_srcs.add("DoseOnCamera/pixel²")
+                    except: pass
+                elif doc:
+                    try:
+                        dose_vals.append(float(doc))
+                        dose_srcs.add("DoseOnCamera (raw)")
+                    except: pass
+            if custom.get("DoseOnCamera"):
+                try: doc_vals.append(float(custom["DoseOnCamera"]))
+                except: pass
+            dr = custom.get("DoseRate")
+            if dr and px_A:
+                try: rate_vals.append(float(dr) / (px_A * px_A))
+                except: pass
+            df = custom.get("AppliedDefocus")
+            if df:
+                try: defoci.add(round(float(df) * 1e6, 2))
+                except: pass
+
+        if dose_vals:
+            meta["movie_dose_avg_e_A2"] = round(sum(dose_vals) / len(dose_vals), 2)
+            meta["movie_dose_range_e_A2"] = [round(min(dose_vals), 2), round(max(dose_vals), 2)]
+            meta["n_dose_movies"] = len(dose_vals)
+            meta["movie_dose_source"] = " + ".join(sorted(dose_srcs))
+        if doc_vals:
+            meta["dose_on_camera_e_pix"] = round(sum(doc_vals) / len(doc_vals), 3)
+        if rate_vals:
+            meta["movie_rate_avg_e_A2_s"] = round(sum(rate_vals) / len(rate_vals), 3)
+        if defoci and "defocus_range_um" not in meta:
+            meta["defocus_values_um"] = sorted(defoci)
+            meta["defocus_range_um"] = (min(defoci), max(defoci))
+
+    # ── Resolve total dose (e/Å² at specimen) ───────────────────────────────
+    # Priority: movie-averaged 'Dose' key > fraction sum (converted) >
+    # DoseOnCamera (converted) > DoseOnCamera (raw)
+    if "movie_dose_avg_e_A2" in meta:
+        meta["total_dose_e_A2"] = meta["movie_dose_avg_e_A2"]
+        meta["dose_source"] = (f"avg of {meta['n_dose_movies']} movies "
+                               f"({meta['movie_dose_source']})")
+    elif "frac_dose_sum_e_pix" in meta and px_A:
+        meta["total_dose_e_A2"] = round(meta["frac_dose_sum_e_pix"] / (px_A * px_A), 2)
+        meta["dose_source"] = f"sum of {meta.get('n_dose_fractions', '?')} fractions (e/pix → e/Å²)"
+    elif "dose_on_camera_e_pix" in meta and px_A:
+        meta["total_dose_e_A2"] = round(meta["dose_on_camera_e_pix"] / (px_A * px_A), 2)
+        meta["dose_source"] = "DoseOnCamera / pixel²"
+    elif "dose_on_camera_e_pix" in meta:
+        meta["total_dose_e_A2"] = meta["dose_on_camera_e_pix"]
+        meta["dose_source"] = "DoseOnCamera (raw; pixel size unknown)"
+
+    # ── Convert per-fraction dose stats from e/pix to e/Å² ──────────────────
+    if px_A and "frac_dose_avg_e_pix" in meta:
+        k = px_A * px_A
+        meta["dose_per_fraction_e_A2"] = round(meta["frac_dose_avg_e_pix"] / k, 3)
+        if "frac_dose_range_e_pix" in meta:
+            meta["fraction_dose_range_e_A2"] = [
+                round(v / k, 3) for v in meta["frac_dose_range_e_pix"]
+            ]
+        if "frac_dose_sum_e_pix" in meta:
+            meta["total_dose_frac_sum_e_A2"] = round(meta["frac_dose_sum_e_pix"] / k, 2)
+
+    # ── Resolve dose rate (e/Å²/s at specimen) ──────────────────────────────
+    if "movie_rate_avg_e_A2_s" in meta:
+        meta["dose_rate_e_A2_s"] = meta["movie_rate_avg_e_A2_s"]
+        meta["dose_rate_source"] = f"avg of {meta['n_dose_movies']} movies (DoseRate/pixel²)"
+    elif px_A and "frac_rate_avg_e_pix_s" in meta:
+        meta["dose_rate_e_A2_s"] = round(meta["frac_rate_avg_e_pix_s"] / (px_A * px_A), 3)
+        meta["dose_rate_source"] = "avg fraction DoseRate (e/pix/s → e/Å²/s)"
 
 # ── Session start date + defocus range from EpuSession.dm ─────────────
     dm_file = p / "EpuSession.dm"
@@ -258,22 +371,6 @@ def extract_metadata(session_path):
                     set(round(v * 1e6, 2) for v in dc_vals)
                 )
         except: pass
-
-    # ── Legacy: scan FoilHole XMLs for actual defocus range ────────────────
-    if "defocus_range_um" not in meta:
-        dvals = set()
-        for xml in (list(p.glob("FoilHole_*.xml")) or list(p.glob("**/FoilHole_*.xml")))[:50]:
-            if "_Fractions" in xml.name:
-                continue
-            try:
-                c = xml.read_text(encoding="utf-8", errors="replace")
-                df = find_first(r"<a:Key>AppliedDefocus</a:Key>\s*<a:Value[^>]*>([^<]+)<", c)
-                if df:
-                    dvals.add(round(float(df) * 1e6, 2))
-            except: pass
-        if dvals:
-            meta["defocus_values_um"] = sorted(dvals)
-            meta["defocus_range_um"] = (min(dvals), max(dvals))
 
     # ── Collection start/end dates from FoilHole XMLs ──────────────────────
     # Use filename timestamp pattern (YYYYMMDD_HHMMSS) for sorting, then
@@ -355,7 +452,9 @@ def discover_collections(base):
             "fractions_xml": fx,
         })
 
-    # Legacy: flat *_Fractions.xml in session root (no EpuSession.dm)
+    # Legacy: flat XMLs in session root (no EpuSession.dm).
+    # Detected via *_Fractions.xml OR movie FoilHole_*.xml (sessions without
+    # fraction metadata files are also valid collections).
     # Check top-level dirs
     for p in sorted(base.iterdir()):
         if not p.is_dir() or p.name == "CS-edwin":
@@ -364,13 +463,14 @@ def discover_collections(base):
         if has_dm:
             continue
         fx = len(list(p.glob("*_Fractions.xml")))
-        if fx > 0:
+        fh = len([f for f in p.glob("FoilHole_*.xml") if "_Fractions" not in f.name])
+        if fx > 0 or fh > 0:
             collections.append({
                 "path": str(p),
                 "rel_path": str(p.relative_to(base)),
                 "type": "legacy",
                 "grid_squares": 0,
-                "foil_holes": 0,
+                "foil_holes": fh,
                 "fractions_xml": fx,
             })
 
@@ -384,7 +484,8 @@ def discover_collections(base):
             if has_dm:
                 continue
             fx = len(list(p.glob("*_Fractions.xml")))
-            if fx > 0:
+            fh = len([f for f in p.glob("FoilHole_*.xml") if "_Fractions" not in f.name])
+            if fx > 0 or fh > 0:
                 # Avoid duplicates
                 rel = str(p.relative_to(base))
                 if not any(c["rel_path"] == rel for c in collections):
@@ -393,7 +494,7 @@ def discover_collections(base):
                         "rel_path": rel,
                         "type": "legacy",
                         "grid_squares": 0,
-                        "foil_holes": 0,
+                        "foil_holes": fh,
                         "fractions_xml": fx,
                     })
 
@@ -402,13 +503,13 @@ def discover_collections(base):
 
 # ── report generation ───────────────────────────────────────────────────────
 
-def generate_report(base, fmt="text"):
+def generate_report(base, fmt="text", max_movies=25):
     base = Path(base).expanduser().resolve()
     collections = discover_collections(base)
 
     # Extract metadata for each
     for c in collections:
-        c["meta"] = extract_metadata(c["path"])
+        c["meta"] = extract_metadata(c["path"], max_movies=max_movies)
 
     if fmt == "json":
         return _json_report(base, collections)
@@ -489,15 +590,19 @@ def _text_report(base, collections):
         if m.get("total_dose_e_A2"):
             src = m.get("dose_source")
             lines.append(f"     Total dose: {m['total_dose_e_A2']} e⁻/Å²" + (f" ({src})" if src else ""))
+        if m.get("movie_dose_range_e_A2"):
+            mn, mx = m["movie_dose_range_e_A2"]
+            if mn != mx:
+                lines.append(f"     Dose per movie: {mn} – {mx} e⁻/Å² ({m.get('n_dose_movies')} movies sampled)")
         if m.get("dose_per_fraction_e_A2") and m.get("fraction_dose_range_e_A2"):
             dmin, dmax = m["fraction_dose_range_e_A2"]
             rng = f", range {dmin} – {dmax}" if dmin != dmax else ""
             lines.append(f"     Dose per fraction: avg {m['dose_per_fraction_e_A2']}{rng} e⁻/Å²")
         if m.get("dose_rate_e_A2_s"):
-            rate_src = "avg over fractions" if "avg_dose_rate_e_A2_s" in m else "movie XML"
-            lines.append(f"     Dose rate: {m['dose_rate_e_A2_s']} e⁻/Å²/s ({rate_src})")
-        if m.get("dose_on_camera_e_A2") and m.get("dose_on_camera_e_A2") != m.get("total_dose_e_A2"):
-            lines.append(f"     DoseOnCamera (ref): {m['dose_on_camera_e_A2']} e⁻/Å²")
+            rsrc = m.get("dose_rate_source", "")
+            lines.append(f"     Dose rate: {m['dose_rate_e_A2_s']} e⁻/Å²/s" + (f" ({rsrc})" if rsrc else ""))
+        if m.get("dose_on_camera_e_pix"):
+            lines.append(f"     DoseOnCamera (ref): {m['dose_on_camera_e_pix']} e⁻/pix")
         if m.get("frac_exposure_time_s"): lines.append(f"     Exposure per fraction: {m['frac_exposure_time_s']} s")
         if m.get("total_exposure_s"): lines.append(f"     Total exposure: {m['total_exposure_s']} s")
         elif m.get("exposure_time_s"): lines.append(f"     Exposure time: {m['exposure_time_s']} s")
@@ -542,11 +647,15 @@ def _json_report(base, collections):
             "defocus_values_um": m.get("defocus_values_um"),
             "total_dose_e_A2": m.get("total_dose_e_A2"),
             "dose_source": m.get("dose_source"),
-            "dose_on_camera_e_A2": m.get("dose_on_camera_e_A2"),
+            "movie_dose_range_e_A2": m.get("movie_dose_range_e_A2"),
+            "n_dose_movies": m.get("n_dose_movies"),
+            "dose_on_camera_e_pix": m.get("dose_on_camera_e_pix"),
+            "total_dose_frac_sum_e_A2": m.get("total_dose_frac_sum_e_A2"),
             "dose_per_fraction_e_A2": m.get("dose_per_fraction_e_A2"),
             "fraction_dose_range_e_A2": m.get("fraction_dose_range_e_A2"),
             "n_dose_fractions": m.get("n_dose_fractions"),
             "dose_rate_e_A2_s": m.get("dose_rate_e_A2_s"),
+            "dose_rate_source": m.get("dose_rate_source"),
             "exposure_time_s": m.get("exposure_time_s"),
             "total_exposure_s": m.get("total_exposure_s"),
             "session_start": m.get("session_start"),
@@ -567,9 +676,12 @@ def main():
     parser.add_argument("--format", "-f", choices=["json", "text"], default="text",
                         help="Output format (default: text)")
     parser.add_argument("--output", "-o", help="Write output to file")
+    parser.add_argument("--max-movies", type=int, default=25,
+                        help="Max movie XMLs sampled per collection for dose "
+                             "statistics (default: 25)")
     args = parser.parse_args()
 
-    result = generate_report(args.base, args.format)
+    result = generate_report(args.base, args.format, max_movies=args.max_movies)
 
     if args.output:
         Path(args.output).write_text(result, encoding="utf-8")

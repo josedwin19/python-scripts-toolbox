@@ -11,16 +11,16 @@ Metadata collector for cryo-EM data acquisition directories. Automatically disco
 - **Auto-discovery**: Scans a base directory and finds all cryo-EM collections automatically — no need to specify each session individually.
 - **Dual layout support**:
   - **Modern EPU** (3.x+): directories with `EpuSession.dm`, `Images-Disc*/GridSquare*/Data/FoilHole_*.xml`
-  - **Legacy**: flat `*_Fractions.xml` files in session root (no `EpuSession.dm`)
+  - **Legacy**: flat `FoilHole_*.xml` / `*_Fractions.xml` files in session root (no `EpuSession.dm`) — sessions **without** Fractions XML are detected too
 - **Exclusion filter**: Automatically skips `CS-edwin` project directories.
 - **PAD4 support**: Detects collections inside `PAD4/` subdirectory.
 - **Rich metadata extraction** per collection:
   - Pixel size (Å, 5 decimals) — from the movie XML, with `SensorPixelSize` from the Fractions XML as fallback
   - Acceleration voltage (kV), nominal magnification
   - Detector name, electron counting status
-  - **Dose (validated)**: total dose computed as the **sum of per-fraction `TotalDose`** from the Fractions XML; `DoseOnCamera` from the movie XML is kept as an independent reference
-  - Dose rate (e⁻/Å²/s, averaged over fractions), dose per fraction (avg + min/max range, useful QC for uneven fraction schemes)
-  - Defocus range and individual defocus values (µm)
+  - **Dose (specimen, e/Å²)**: averaged over up to `--max-movies` sampled movies via the SI `Dose` key, with per-movie range (dose varies between movies); cross-validated against the sum of per-fraction `TotalDose` when a Fractions XML exists
+  - Dose rate (e/Å²/s), dose per fraction (avg + min/max range, useful QC for uneven fraction schemes)
+  - Defocus range and individual defocus values (µm) — from `EpuSession.dm` or per-movie `AppliedDefocus`
   - Fractions per movie (expected vs. recorded), exposure per fraction, total exposure (s)
   - Session start date, first/last acquisition timestamps
   - Grid square count, foil hole count, movie count
@@ -71,6 +71,7 @@ python3 CryoEM_Collector.py --format json -o report.json
 | `--base` | `-b` | Base directory to scan for collections | `~/cryosparc_projs` |
 | `--format` | `-f` | Output format: `text` or `json` | `text` |
 | `--output` | `-o` | Write output to file instead of stdout | *(stdout)* |
+| `--max-movies` | | Max movie XMLs sampled per collection for dose statistics | `25` |
 
 ```bash
 python3 CryoEM_Collector.py --help
@@ -105,10 +106,11 @@ DETAILS:
      Fractions/movie: 40
      Defocus range: -0.8 to -2.0 µm
      Defocus values: [-2.0, -1.8, -1.5, -1.2, -1.0, -0.8] µm
-     Total dose: 40.35 e⁻/Å² (sum of 40 fractions)
-     Dose per fraction: avg 1.009, range 0.879 – 5.559 e⁻/Å²
-     Dose rate: 0.993 e⁻/Å²/s (avg over fractions)
-     DoseOnCamera (ref): 40.35 e⁻/Å²
+     Total dose: 53.13 e⁻/Å² (avg of 12 movies (Dose key (e/m²)))
+     Dose per movie: 52.41 – 54.02 e⁻/Å² (12 movies sampled)
+     Dose per fraction: avg 1.329, range 1.157 – 7.319 e⁻/Å²
+     Dose rate: 1.307 e⁻/Å²/s (avg fraction DoseRate (e/pix/s → e/Å²/s))
+     DoseOnCamera (ref): 40.35 e⁻/pix
      Exposure per fraction: 0.897 s
      Total exposure: 40.87 s
      Session start: 2026-01-15 09:12
@@ -144,13 +146,17 @@ DETAILS:
     "defocus_um": -1.5,
     "defocus_range_um": [-2.0, -0.8],
     "defocus_values_um": [-2.0, -1.8, -1.5, -1.2, -1.0, -0.8],
-    "total_dose_e_A2": 40.35,
-    "dose_source": "sum of 40 fractions",
-    "dose_on_camera_e_A2": 40.35,
-    "dose_per_fraction_e_A2": 1.009,
-    "fraction_dose_range_e_A2": [0.879, 5.559],
+    "total_dose_e_A2": 53.13,
+    "dose_source": "avg of 12 movies (Dose key (e/m²))",
+    "movie_dose_range_e_A2": [52.41, 54.02],
+    "n_dose_movies": 12,
+    "dose_on_camera_e_pix": 40.35,
+    "total_dose_frac_sum_e_A2": 53.13,
+    "dose_per_fraction_e_A2": 1.329,
+    "fraction_dose_range_e_A2": [1.157, 7.319],
     "n_dose_fractions": 40,
-    "dose_rate_e_A2_s": 0.993,
+    "dose_rate_e_A2_s": 1.307,
+    "dose_rate_source": "avg fraction DoseRate (e/pix/s → e/Å²/s)",
     "exposure_time_s": 42.195,
     "total_exposure_s": 40.87,
     "session_start": "2026-01-15T09:12:00",
@@ -164,19 +170,43 @@ DETAILS:
 
 ## How It Works
 
-1. **Discovery**: Scans the base directory recursively for `EpuSession.dm` files (modern EPU) and top-level directories with `*_Fractions.xml` (legacy). Skips `CS-edwin`.
+1. **Discovery**: Scans the base directory recursively for `EpuSession.dm` files (modern EPU) and top-level directories with `*_Fractions.xml` **or** `FoilHole_*.xml` movie files (legacy). Skips `CS-edwin`.
 2. **Metadata extraction**: For each collection:
    - Reads `EpuSession.dm` for session name, start date, and defocus values.
-   - Parses a sample `FoilHole_*.xml` (non-Fractions) for pixel size, voltage, magnification, detector, defocus, and `DoseOnCamera`.
-   - Parses a `*_Fractions.xml` for fractions count, electron counting, detector name, `SensorPixelSize`, and **per-fraction dose data** (`TotalDose`, `DoseRate`, `ExposureTime` — only blocks with `SampleType = DoseFraction` are considered).
+   - Parses a sample `FoilHole_*.xml` (non-Fractions) for pixel size, voltage, magnification, detector, defocus, and exposure time.
+   - Parses a `*_Fractions.xml` (if present) for fractions count, electron counting, detector name, `SensorPixelSize`, and per-fraction dose data (`TotalDose`, `DoseRate`, `ExposureTime` — only blocks with `SampleType = DoseFraction`).
    - Samples first/last FoilHole files to determine acquisition date range.
-3. **Dose calculation**:
-   - `total_dose_e_A2` = **sum of all per-fraction `TotalDose`** values (preferred; cross-validated against `DoseOnCamera` from the movie XML, which is reported as an independent reference when it differs).
-   - `dose_rate_e_A2_s` = average of per-fraction `DoseRate`.
-   - `dose_per_fraction_e_A2` = mean fraction dose, with min–max range — useful to detect uneven fraction schemes (e.g., a longer final fraction).
-   - `total_exposure_s` = sum of per-fraction exposure times.
-   - If the Fractions XML has no dose data, `DoseOnCamera` is used as fallback and the `dose_source` field indicates it.
+3. **Dose sampling**: Evenly samples up to `--max-movies` movie XMLs per collection and extracts per-movie dose, dose rate, and applied defocus — dose varies between movies, so a single sample is not representative.
 4. **Report generation**: Aggregates all collections into a summary table (text) or array of objects (JSON).
+
+## ⚠️ Dose Units (important)
+
+EPU writes dose-related values in **different units depending on the key**. This was validated on real data from a **Falcon 3EC** and a **BioContinuum K3** (energy-filtered) session:
+
+| Key | Source file | Unit | Meaning |
+|---|---|---|---|
+| `Dose` | movie XML | **e/m² (SI)** | **Dose at the specimen — authoritative** |
+| `DoseOnCamera` | movie XML | e/counted-pixel | Accumulated electrons per pixel |
+| `DoseRate` | movie XML | e/pix/s | Rate per counted pixel |
+| `TotalDose` (per fraction) | Fractions XML | e/pix | Per-fraction dose per pixel |
+| `DoseRate` (per fraction) | Fractions XML | e/pix/s | Per-fraction rate per pixel |
+
+The conversion (verified to match exactly on both detectors):
+
+```
+dose [e/Å²] = Dose / 1e20 = DoseOnCamera / pixel_size² [Å²]
+```
+
+Example (Falcon 3EC, pixel 0.87148 Å): `DoseOnCamera = 40.35 e/pix` → `40.35 / 0.87148² = 53.13 e/Å² = Dose/1e20` ✓
+
+**The script reports `total_dose_e_A2` with this priority:**
+
+1. Average of `Dose`/1e20 over sampled movies (most representative; works with or without Fractions XML)
+2. Sum of per-fraction `TotalDose`, converted with `/pixel_size²` (single movie)
+3. `DoseOnCamera / pixel_size²`
+4. `DoseOnCamera` raw (only if pixel size is unknown — flagged in `dose_source`)
+
+`DoseOnCamera` is always kept as an independent reference (`dose_on_camera_e_pix`, in e/pix), and dose rate is converted to e/Å²/s the same way.
 
 ---
 
